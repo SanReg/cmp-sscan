@@ -8,35 +8,47 @@
 </head>
 <body class="bg-gray-900 text-gray-100 min-h-screen flex items-center justify-center">
   <div class="w-full max-w-2xl p-6 space-y-6">
-    <div class="flex items-center justify-between bg-gray-800 rounded-xl p-6">
+    <div data-prefix="" class="flex items-center justify-between bg-gray-800 rounded-xl p-6">
       <div>
         <h1 class="text-xl font-semibold">Similarity Scan</h1>
-        <p id="state" class="text-sm text-gray-400">off</p>
+        <p data-state class="text-sm text-gray-400">off</p>
       </div>
-      <button id="toggle" class="relative w-16 h-9 rounded-full bg-gray-600 transition-colors">
-        <span id="knob" class="absolute top-1 left-1 w-7 h-7 rounded-full bg-white transition-transform"></span>
+      <button data-toggle class="relative w-16 h-9 rounded-full bg-gray-600 transition-colors">
+        <span data-knob class="absolute top-1 left-1 w-7 h-7 rounded-full bg-white transition-transform"></span>
+      </button>
+    </div>
+    <div data-prefix="/scribehub" class="flex items-center justify-between bg-gray-800 rounded-xl p-6">
+      <div>
+        <h1 class="text-xl font-semibold">ScribeHub</h1>
+        <p data-state class="text-sm text-gray-400">off</p>
+      </div>
+      <button data-toggle class="relative w-16 h-9 rounded-full bg-gray-600 transition-colors">
+        <span data-knob class="absolute top-1 left-1 w-7 h-7 rounded-full bg-white transition-transform"></span>
       </button>
     </div>
   </div>
   <script>
-    const btn = document.getElementById('toggle');
-    function render(s) {
-      btn.classList.toggle('bg-green-500', s.running);
-      btn.classList.toggle('bg-gray-600', !s.running);
-      document.getElementById('knob').style.transform = s.running ? 'translateX(28px)' : '';
-      document.getElementById('state').textContent = s.running
-        ? (s.active && s.active.length ? `on — processing ${s.active.length} order(s)` : 'on — waiting for orders')
-        : 'off';
-    }
-    async function refresh() {
-      render(await (await fetch('/api/status')).json());
-    }
-    btn.onclick = async () => {
-      render(await (await fetch('/api/toggle', { method: 'POST' })).json());
+    document.querySelectorAll('[data-prefix]').forEach((card) => {
+      const prefix = card.dataset.prefix;
+      const btn = card.querySelector('[data-toggle]');
+      function render(s) {
+        btn.classList.toggle('bg-green-500', s.running);
+        btn.classList.toggle('bg-gray-600', !s.running);
+        card.querySelector('[data-knob]').style.transform = s.running ? 'translateX(28px)' : '';
+        card.querySelector('[data-state]').textContent = s.running
+          ? (s.active && s.active.length ? `on — processing ${s.active.length} order(s)` : 'on — waiting for orders')
+          : 'off';
+      }
+      async function refresh() {
+        render(await (await fetch(`${prefix}/api/status`)).json());
+      }
+      btn.onclick = async () => {
+        render(await (await fetch(`${prefix}/api/toggle`, { method: 'POST' })).json());
+        refresh();
+      };
       refresh();
-    };
-    refresh();
-    setInterval(refresh, 2000);
+      setInterval(refresh, 2000);
+    });
   </script>
 </body>
 </html>

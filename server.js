@@ -12,13 +12,13 @@ cloudinary.config({
 const API_BASE = 'https://nwlguwssyxjpjddolsvl.supabase.co/functions/v1';
 const AUTH = { Authorization: `Bearer ${process.env.BEARER_TOKEN}` };
 
-let running = false;
-const active = new Set(); // order ids currently being processed
+const SH_BASE = 'https://api.scribehub.work/api/v1';
+const SH_AUTH = { Authorization: `Bearer ${process.env.SCRIBE_HUB}` };
+
 const MAX_CONCURRENT = 5;
 const addLog = (msg) => console.log(`${new Date().toISOString()} ${msg}`);
 
 let ordersCol, usersCol;
-let startedAt = null; // only orders created after toggle-on are picked up
 
 async function refundOrder(order) {
   // claim the refund atomically so it can never run twice for one order
@@ -49,24 +49,8 @@ async function refundOrder(order) {
   }
 }
 
-async function apiUpload(buf, filename) {
-  const fd = new FormData();
-  fd.append('file', new Blob([buf]), filename);
-  fd.append('excludeQuotes', 'true');
-  const res = await fetch(`${API_BASE}/api-documents`, { method: 'POST', headers: AUTH, body: fd });
-  const body = await res.json().catch(() => ({}));
-  if (!res.ok || !body.orderId) throw new Error(`api-documents failed (${res.status}): ${JSON.stringify(body)}`);
-  return body.orderId;
-}
-
-async function apiGet(id) {
-  const res = await fetch(`${API_BASE}/api-document-get?id=${id}`, { headers: AUTH });
-  if (!res.ok) throw new Error(`api-document-get failed (${res.status})`);
-  return res.json();
-}
-
-async function download(url) {
-  const res = await fetch(url);
+async function download(url, headers = {}) {
+  const res = await fetch(url, { headers });
   if (!res.ok) throw new Error(`download failed (${res.status}): ${url}`);
   return Buffer.from(await res.arrayBuffer());
 }
@@ -82,28 +66,75 @@ async function uploadToCloudinary(buf, filename) {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const stamp = () => Date.now();
 
-async function processOrder(order) {
+// --- provider check implementations: take a file, return both report buffers ---
+
+async function similarityScanCheck(buf, filename) {
+  const fd = new FormData();
+  fd.append('file', new Blob([buf]), filename);
+  fd.append('excludeQuotes', 'true');
+  const res = await fetch(`${API_BASE}/api-documents`, { method: 'POST', headers: AUTH, body: fd });
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok || !body.orderId) throw new Error(`api-documents failed (${res.status}): ${JSON.stringify(body)}`);
+
+  let doc;
+  while (true) {
+    await sleep(30000);
+    const r = await fetch(`${API_BASE}/api-document-get?id=${body.orderId}`, { headers: AUTH });
+    if (!r.ok) throw new Error(`api-document-get failed (${r.status})`);
+    doc = await r.json();
+    if (['completed', 'error', 'failed_invalid'].includes(doc.status)) break;
+  }
+  if (doc.status !== 'completed') {
+    throw new Error(`check API returned status "${doc.status}"${doc.error ? ': ' + doc.error : ''}`);
+  }
+  const [aiBuf, simBuf] = await Promise.all([
+    download(doc.reports.ai.downloadUrl),
+    download(doc.reports.similarity.downloadUrl),
+  ]);
+  return { aiBuf, simBuf };
+}
+
+async function scribehubCheck(buf, filename) {
+  const fd = new FormData();
+  fd.append('file', new Blob([buf]), filename);
+  const res = await fetch(`${SH_BASE}/checks`, { method: 'POST', headers: SH_AUTH, body: fd });
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok || !body.id) throw new Error(`scribehub POST /checks failed (${res.status}): ${JSON.stringify(body)}`);
+
+  let doc;
+  while (true) {
+    await sleep(30000);
+    const r = await fetch(`${SH_BASE}/checks/${body.id}`, { headers: SH_AUTH });
+    if (!r.ok) throw new Error(`scribehub GET /checks/${body.id} failed (${r.status})`);
+    doc = await r.json();
+    if (['completed', 'cancelled'].includes(doc.status)) break;
+  }
+  if (doc.status !== 'completed') throw new Error(`scribehub returned status "${doc.status}"`);
+  // order needs both reports; ai_unavailable means Turnitin couldn't score AI → fail + refund
+  if (doc.ai_unavailable) throw new Error('scribehub: Turnitin could not produce an AI report (ai_unavailable)');
+
+  const [aiBuf, simBuf] = await Promise.all([
+    download(`${SH_BASE}/checks/${body.id}/reports/ai`, SH_AUTH),
+    download(`${SH_BASE}/checks/${body.id}/reports/similarity`, SH_AUTH),
+  ]);
+  return { aiBuf, simBuf };
+}
+
+// --- generic worker, one instance per provider ---
+
+const providers = {
+  sscan: { name: 'sscan', runCheck: similarityScanCheck, running: false, active: new Set(), startedAt: null },
+  scribehub: { name: 'scribehub', runCheck: scribehubCheck, running: false, active: new Set(), startedAt: null },
+};
+
+async function processOrder(p, order) {
   const id = String(order._id);
-  addLog(`processing order ${id} (${order.userFile.filename})`);
+  addLog(`[${p.name}] processing order ${id} (${order.userFile.filename})`);
   try {
     const fileBuf = await download(order.userFile.url);
-    const apiOrderId = await apiUpload(fileBuf, order.userFile.filename);
-
-    let doc;
-    while (true) {
-      await sleep(30000);
-      doc = await apiGet(apiOrderId);
-      if (['completed', 'error', 'failed_invalid'].includes(doc.status)) break;
-    }
-    if (doc.status !== 'completed') {
-      throw new Error(`check API returned status "${doc.status}"${doc.error ? ': ' + doc.error : ''}`);
-    }
+    const { aiBuf, simBuf } = await p.runCheck(fileBuf, order.userFile.filename);
 
     const base = order.userFile.filename.replace(/\.[^.]+$/, '');
-    const [aiBuf, simBuf] = await Promise.all([
-      download(doc.reports.ai.downloadUrl),
-      download(doc.reports.similarity.downloadUrl),
-    ]);
     const [aiReport, similarityReport] = await Promise.all([
       uploadToCloudinary(aiBuf, `${base}_ai_${stamp()}.pdf`),
       uploadToCloudinary(simBuf, `${base}_similarity_${stamp()}.pdf`),
@@ -113,28 +144,28 @@ async function processOrder(order) {
       { _id: order._id },
       { $set: { status: 'completed', completedAt: new Date(), failureReason: null, processingAt: null, adminFiles: { aiReport, similarityReport } } }
     );
-    addLog(`order ${id} completed`);
+    addLog(`[${p.name}] order ${id} completed`);
   } catch (err) {
-    addLog(`order ${id} FAILED: ${err.message}`);
+    addLog(`[${p.name}] order ${id} FAILED: ${err.message}`);
     await ordersCol.updateOne(
       { _id: order._id },
       { $set: { status: 'failed', failureReason: err.message, processingAt: null } }
     ).catch((e) => addLog(`could not mark failed: ${e.message}`));
     await refundOrder(order).catch((e) => addLog(`refund failed for order ${id}: ${e.message}`));
   } finally {
-    active.delete(id);
+    p.active.delete(id);
   }
 }
 
-// Claims one order atomically so two concurrent workers can never grab the same
-// one. processingAt is our own field, so `status` keeps the meaning the rest of
-// the app expects (pending until it really is completed/failed).
-async function claimOrder() {
+// Claims one order atomically so two concurrent workers (even across providers)
+// can never grab the same one. processingAt is our own field, so `status` keeps
+// the meaning the rest of the app expects.
+async function claimOrder(p) {
   const res = await ordersCol.findOneAndUpdate(
     {
       status: 'pending',
       'userFile.url': { $exists: true },
-      createdAt: { $gt: startedAt },
+      createdAt: { $gt: p.startedAt },
       processingAt: { $in: [null] },
     },
     { $set: { processingAt: new Date() } },
@@ -143,26 +174,26 @@ async function claimOrder() {
   return res && res.value !== undefined ? res.value : res; // driver v5 vs v6+ shape
 }
 
-async function workerLoop() {
-  while (running) {
+async function workerLoop(p) {
+  while (p.running) {
     try {
-      while (running && active.size < MAX_CONCURRENT) {
-        const order = await claimOrder();
+      while (p.running && p.active.size < MAX_CONCURRENT) {
+        const order = await claimOrder(p);
         if (!order) break;
         const id = String(order._id);
-        active.add(id);
+        p.active.add(id);
         // deliberately not awaited: that is what makes them run in parallel
-        processOrder(order).catch((e) => {
-          active.delete(id);
-          addLog(`order ${id} crashed: ${e.message}`);
+        processOrder(p, order).catch((e) => {
+          p.active.delete(id);
+          addLog(`[${p.name}] order ${id} crashed: ${e.message}`);
         });
       }
     } catch (err) {
-      addLog(`worker error: ${err.message}`);
+      addLog(`[${p.name}] worker error: ${err.message}`);
     }
     await sleep(5000);
   }
-  addLog('worker stopped');
+  addLog(`[${p.name}] worker stopped`);
 }
 
 const app = express();
@@ -176,25 +207,36 @@ app.use((req, res, next) => {
 });
 app.use(express.static('public'));
 
-app.get('/api/status', (req, res) => res.json({ running, active: [...active] }));
+function mountRoutes(prefix, p, extraHealth) {
+  app.get(`${prefix}/api/status`, (req, res) => res.json({ running: p.running, active: [...p.active] }));
 
-app.get('/health', async (req, res) => {
-  try {
-    await ordersCol.findOne({}, { projection: { _id: 1 } }); // proves db is reachable
-    res.json({ status: 'ok', running, active: [...active], uptime: process.uptime() });
-  } catch (err) {
-    res.status(503).json({ status: 'error', error: err.message });
-  }
-});
+  app.post(`${prefix}/api/toggle`, (req, res) => {
+    p.running = !p.running;
+    if (p.running) {
+      p.startedAt = new Date();
+      addLog(`[${p.name}] worker started, watching for orders created after ${p.startedAt.toISOString()}`);
+      workerLoop(p);
+    }
+    res.json({ running: p.running });
+  });
 
-app.post('/api/toggle', (req, res) => {
-  running = !running;
-  if (running) {
-    startedAt = new Date();
-    addLog(`worker started, watching for orders created after ${startedAt.toISOString()}`);
-    workerLoop();
-  }
-  res.json({ running });
+  app.get(`${prefix}/health`, async (req, res) => {
+    try {
+      await ordersCol.findOne({}, { projection: { _id: 1 } }); // proves db is reachable
+      const extra = extraHealth ? await extraHealth() : {};
+      res.json({ status: 'ok', running: p.running, active: [...p.active], uptime: process.uptime(), ...extra });
+    } catch (err) {
+      res.status(503).json({ status: 'error', error: err.message });
+    }
+  });
+}
+
+mountRoutes('', providers.sscan);
+mountRoutes('/scribehub', providers.scribehub, async () => {
+  const r = await fetch(`${SH_BASE}/credit`, { headers: SH_AUTH });
+  const c = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(`scribehub /credit failed (${r.status})${c.error ? ': ' + c.error : ''}`);
+  return { credit: c };
 });
 
 async function connect() {
