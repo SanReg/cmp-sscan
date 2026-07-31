@@ -1,0 +1,42 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Similarity Scan</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-900 text-gray-100 min-h-screen flex items-center justify-center">
+  <div class="w-full max-w-2xl p-6 space-y-6">
+    <div class="flex items-center justify-between bg-gray-800 rounded-xl p-6">
+      <div>
+        <h1 class="text-xl font-semibold">Similarity Scan</h1>
+        <p id="state" class="text-sm text-gray-400">off</p>
+      </div>
+      <button id="toggle" class="relative w-16 h-9 rounded-full bg-gray-600 transition-colors">
+        <span id="knob" class="absolute top-1 left-1 w-7 h-7 rounded-full bg-white transition-transform"></span>
+      </button>
+    </div>
+  </div>
+  <script>
+    const btn = document.getElementById('toggle');
+    function render(s) {
+      btn.classList.toggle('bg-green-500', s.running);
+      btn.classList.toggle('bg-gray-600', !s.running);
+      document.getElementById('knob').style.transform = s.running ? 'translateX(28px)' : '';
+      document.getElementById('state').textContent = s.running
+        ? (s.active && s.active.length ? `on — processing ${s.active.length} order(s)` : 'on — waiting for orders')
+        : 'off';
+    }
+    async function refresh() {
+      render(await (await fetch('/api/status')).json());
+    }
+    btn.onclick = async () => {
+      render(await (await fetch('/api/toggle', { method: 'POST' })).json());
+      refresh();
+    };
+    refresh();
+    setInterval(refresh, 2000);
+  </script>
+</body>
+</html>
