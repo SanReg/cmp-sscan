@@ -87,9 +87,12 @@ async function similarityScanCheck(buf, filename) {
   if (doc.status !== 'completed') {
     throw new Error(`check API returned status "${doc.status}"${doc.error ? ': ' + doc.error : ''}`);
   }
+  const aiUrl = doc.reports?.ai?.downloadUrl;
+  const simUrl = doc.reports?.similarity?.downloadUrl;
+  if (!aiUrl && !simUrl) throw new Error('completed but no reports available');
   const [aiBuf, simBuf] = await Promise.all([
-    download(doc.reports.ai.downloadUrl),
-    download(doc.reports.similarity.downloadUrl),
+    aiUrl ? download(aiUrl) : null,
+    simUrl ? download(simUrl) : null,
   ]);
   return { aiBuf, simBuf };
 }
@@ -110,12 +113,13 @@ async function scribehubCheck(buf, filename) {
     if (['completed', 'cancelled'].includes(doc.status)) break;
   }
   if (doc.status !== 'completed') throw new Error(`scribehub returned status "${doc.status}"`);
-  // order needs both reports; ai_unavailable means Turnitin couldn't score AI → fail + refund
-  if (doc.ai_unavailable) throw new Error('scribehub: Turnitin could not produce an AI report (ai_unavailable)');
 
+  if (!doc.ai_report_available && !doc.similarity_report_available) {
+    throw new Error('scribehub: completed but no reports available');
+  }
   const [aiBuf, simBuf] = await Promise.all([
-    download(`${SH_BASE}/checks/${body.id}/reports/ai`, SH_AUTH),
-    download(`${SH_BASE}/checks/${body.id}/reports/similarity`, SH_AUTH),
+    doc.ai_report_available ? download(`${SH_BASE}/checks/${body.id}/reports/ai`, SH_AUTH) : null,
+    doc.similarity_report_available ? download(`${SH_BASE}/checks/${body.id}/reports/similarity`, SH_AUTH) : null,
   ]);
   return { aiBuf, simBuf };
 }
@@ -136,15 +140,18 @@ async function processOrder(p, order) {
 
     const base = order.userFile.filename.replace(/\.[^.]+$/, '');
     const [aiReport, similarityReport] = await Promise.all([
-      uploadToCloudinary(aiBuf, `${base}_ai_${stamp()}.pdf`),
-      uploadToCloudinary(simBuf, `${base}_similarity_${stamp()}.pdf`),
+      aiBuf ? uploadToCloudinary(aiBuf, `${base}_ai_${stamp()}.pdf`) : null,
+      simBuf ? uploadToCloudinary(simBuf, `${base}_similarity_${stamp()}.pdf`) : null,
     ]);
 
+    const adminFiles = {};
+    if (aiReport) adminFiles.aiReport = aiReport;
+    if (similarityReport) adminFiles.similarityReport = similarityReport;
     await ordersCol.updateOne(
       { _id: order._id },
-      { $set: { status: 'completed', completedAt: new Date(), failureReason: null, processingAt: null, adminFiles: { aiReport, similarityReport } } }
+      { $set: { status: 'completed', completedAt: new Date(), failureReason: null, processingAt: null, adminFiles } }
     );
-    addLog(`[${p.name}] order ${id} completed`);
+    addLog(`[${p.name}] order ${id} completed${aiReport && similarityReport ? '' : ` (only ${aiReport ? 'ai' : 'similarity'} report available)`}`);
   } catch (err) {
     addLog(`[${p.name}] order ${id} FAILED: ${err.message}`);
     await ordersCol.updateOne(
