@@ -156,7 +156,7 @@ async function processOrder(p, order) {
     addLog(`[${p.name}] order ${id} FAILED: ${err.message}`);
     await ordersCol.updateOne(
       { _id: order._id },
-      { $set: { status: 'failed', failureReason: err.message, processingAt: null } }
+      { $set: { status: 'failed', failureReason: 'Please try again after some time!', processingAt: null } }
     ).catch((e) => addLog(`could not mark failed: ${e.message}`));
     await refundOrder(order).catch((e) => addLog(`refund failed for order ${id}: ${e.message}`));
   } finally {
